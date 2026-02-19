@@ -8,7 +8,6 @@ SakilaBase = declarative_base()
 class DimDate(LiteBase):
     __tablename__ = 'dim_date'
     
-    # Generate this key in ETL using YYYYMMDD format
     date_key = Column(Integer, primary_key=True) 
     date = Column(String) #SQL-Lite, so we keep things lite
     year = Column(Integer)

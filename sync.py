@@ -3,6 +3,7 @@
 
 import sys
 from datetime import date, timedelta, datetime
+from sqlalchemy.orm import joinedload
 from sqlalchemy import text, func, or_
 from connectors import mysql_engine, sqlite_engine, SQLiteSession, MySQLSession
 from models import LiteBase, DimDate, SyncState
@@ -324,13 +325,14 @@ def run_full_load():
     sqlite_session = SQLiteSession()
     
     try:
+        row_count = sqlite_session.query(FactRental).count()
+        if row_count > 0:
+            print(f"SQLite already contains {row_count} records.")
+            print("Use 'incremental' to sync new data, or 'init' to start over.")
+            return
         load_dims(mysql_session, sqlite_session)
         load_bridges(mysql_session, sqlite_session)
         load_facts(mysql_session, sqlite_session)
-        # validate_sync(mysql_session, sqlite_session)
-        # 4. Update Sync State to current time
-        # update_sync_state(sqlite_session)
-        # If everything above worked, commit the transaction!
         sqlite_session.commit()
         print("Full Load SUCCESSFUL.")
         
@@ -582,7 +584,9 @@ def sync_fact_payment_inc(mysql_session, sqlite_session):
 def sync_fact_rental_inc(mysql_session, sqlite_session):
     '''The worst one of them all. This is so many joins.'''
     last_sync = get_last_sync(sqlite_session, 'fact_rental')
-    changes = mysql_session.query(Rental).filter(Rental.last_update > last_sync).all()
+    changes = mysql_session.query(Rental)\
+        .options(joinedload(Rental.inventory))\
+        .filter(Rental.last_update > last_sync).all()
     if not changes: return 0
     rental_ids = [r.rental_id for r in changes]
     sqlite_session.query(FactRental).filter(FactRental.rental_id.in_(rental_ids)).delete(synchronize_session=False)
@@ -616,13 +620,13 @@ def sync_fact_rental_inc(mysql_session, sqlite_session):
     update_sync_state(sqlite_session, 'fact_rental', max(r.last_update for r in changes))
     return len(changes)
 
-def validate():
+def validate(mysql_session, sqlite_session):
     """Compares row counts and totals per store.
     """
     print("Validating")
     
-    mysql_session = MySQLSession()
-    sqlite_session = SQLiteSession()
+    # mysql_session = MySQLSession()
+    # sqlite_session = SQLiteSession()
     mysql_rentals = mysql_session.query(func.count(Rental.rental_id)).scalar()
     sqlite_rentals = sqlite_session.query(func.count(FactRental.rental_id)).scalar()
     
@@ -640,20 +644,20 @@ def validate():
      .join(FactPayment, FactPayment.rental_id == FactRental.rental_id)\
      .group_by(DimStore.store_id).all()
 
-    # Convert results for comparison: {id: total_amount}
+    #Convert results for comparison: {id: total_amount}
     m_totals = {row[0]: round(float(row[1]), 2) for row in mysql_store_totals}
     s_totals = {row[0]: round(float(row[1]), 2) for row in sqlite_store_totals}
 
     is_valid = True
     
-    # Check 1: Record Counts
+    #Check against record
     if mysql_rentals != sqlite_rentals:
         print(f" Wrong Total! MySQL: {mysql_rentals}, SQLite: {sqlite_rentals}")
         is_valid = False
     else:
         print(f" Total was {sqlite_rentals}")
 
-    # Check 2: Financial Integrity per Store
+    #Check per store as requested
     for store_id, m_amt in m_totals.items():
         s_amt = s_totals.get(store_id, 0)
         if m_amt != s_amt:
@@ -688,17 +692,17 @@ def init_command():
     finally:
         session.close()
 
-def run_sync():
+def run_sync(mysql_session, sqlite_session):
     """Big sync function to handle incremental syncing correctly and in order
     """
     print(f"Synching!!!! {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ")
     
-    mysql_session = MySQLSession()
-    sqlite_session = SQLiteSession()
+    # mysql_session = MySQLSession()
+    # sqlite_session = SQLiteSession()
     try:
-        print("\nSyncing Dimensions...")
+        print("\nSyncing Actor...")
         sync_dim_actor_inc(mysql_session, sqlite_session)
-        print('Actor')
+        print('Category')
         sync_dim_category_inc(mysql_session, sqlite_session)
         print('Store')
         sync_dim_store_inc(mysql_session, sqlite_session)
@@ -707,14 +711,14 @@ def run_sync():
         print('Film')
         sync_dim_film_inc(mysql_session, sqlite_session)
 
-        print("\nNext, Syncing Bridge.")
+        print("\nNext, Syncing Bridge. Film Actor.")
         sync_bridge_film_actor_inc(mysql_session, sqlite_session)
-        print('Cat')
+        print('Film Category.')
         sync_bridge_film_category_inc(mysql_session, sqlite_session)
 
-        print("\nLast and certainly not least, Syncing Facts.")
+        print("\nLast and certainly not least, Syncing Facts. Rentals.")
         rentals_synced = sync_fact_rental_inc(mysql_session, sqlite_session)
-        print('Ca2')
+        print('Payments.')
         payments_synced = sync_fact_payment_inc(mysql_session, sqlite_session)
         
         print(f"Processed {rentals_synced} rentals and {payments_synced} payments.")
@@ -737,16 +741,16 @@ def main():
     parser = argparse.ArgumentParser(description="Sakila SQLite Incremental Manager")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # Init Command
+    #Init Command
     subparsers.add_parser('init', help='Initialise the SQLite database.')
 
-    # Full-load Command
+    #Full-load Command
     subparsers.add_parser('full-load', help='Scrape from Sakila into SQLite.')
 
-    # Incremental Command
+    #Incremental Command
     subparsers.add_parser('incremental', help='Load only new or changed data since the last sync.')
 
-    # Validate Command
+    #Validate Command
     subparsers.add_parser('validate', help='Verify data consistency.')
 
     args = parser.parse_args()
@@ -764,11 +768,11 @@ def main():
             print("Full load success")
 
         elif args.command == 'incremental':
-            run_sync()
+            run_sync(mysql_session, sqlite_session)
             print("Successfully synced changes since last timestamp")
 
         elif args.command == 'validate':
-            if validate():
+            if validate(mysql_session, sqlite_session):
                 print("Validation success.")
             else:
                 print("Failure: Inconsistency detected between MySQL and SQLite.")
@@ -778,8 +782,11 @@ def main():
             parser.print_help()
 
     except Exception as e:
-        print(f"Error {args.command}: {e}")
+        print(f"ERROR!!!! {args.command}: {e}")
         sys.exit(1)
+    finally:
+        mysql_session.close()
+        sqlite_session.close()
 
 if __name__ == "__main__":
     main()
